@@ -2,6 +2,7 @@ mod buffer;
 mod shared;
 mod storage;
 mod tests;
+mod wal;
 
 use std::path::Path;
 

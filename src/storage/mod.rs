@@ -1,3 +1,4 @@
+use std::collections::LinkedList;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -9,6 +10,7 @@ pub struct DiskManager {
     db_file: Mutex<File>,
     file_path: String,
     next_page_id: PageId,
+    free_page_list: LinkedList<PageId>,
 }
 
 impl DiskManager {
@@ -28,6 +30,7 @@ impl DiskManager {
             db_file: Mutex::new(db_file),
             file_path,
             next_page_id: 0,
+            free_page_list: LinkedList::new(),
         })
     }
     
@@ -73,12 +76,16 @@ impl DiskManager {
     }
 
     pub fn get_next_page_id(&mut self) -> PageId {
+        if self.free_page_list.len() > 0 {
+            self.free_page_list.pop_front().unwrap();
+        }
         let page_id = self.next_page_id;
         self.next_page_id += 1;
         page_id
     }
 
-    pub fn delete_page(&self, _page_id: PageId) -> io::Result<()> {
+    pub fn delete_page(&mut self, _page_id: PageId) -> io::Result<()> {
+        self.free_page_list.push_back(_page_id);
         Ok(())
     }
 }
