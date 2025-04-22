@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 use std::hash::Hash;
-use std::rc::Rc;
-use std::cell::RefCell;
 
 use super::linked_lists::{LinkedListLru, Node};
 
@@ -10,7 +9,7 @@ where
     T: Clone + Copy + Eq + Hash,
 {
     list: LinkedListLru<T>,
-    map: HashMap<T, Rc<RefCell<Node<T>>>>,
+    map: HashMap<T, Arc<RwLock<Node<T>>>>,
     size: usize,
 }
 

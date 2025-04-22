@@ -1,6 +1,7 @@
 mod buffer;
 mod shared;
 mod storage;
+mod tests;
 
 use std::path::Path;
 

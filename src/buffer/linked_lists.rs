@@ -1,12 +1,11 @@
-use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Weak, RwLock};
 use std::fmt;
 
 /// A node in the doubly linked list
 pub struct Node<T> {
     pub value: T,
-    pub next: Option<Rc<RefCell<Node<T>>>>,
-    pub prev: Option<Weak<RefCell<Node<T>>>>,
+    pub next: Option<Arc<RwLock<Node<T>>>>,
+    pub prev: Option<Weak<RwLock<Node<T>>>>,
 }
 
 impl<T> Node<T> {
@@ -22,8 +21,8 @@ impl<T> Node<T> {
 
 /// A doubly linked list implementation
 pub struct LinkedListLru<T> {
-    head: Option<Rc<RefCell<Node<T>>>>,
-    tail: Option<Rc<RefCell<Node<T>>>>,
+    head: Option<Arc<RwLock<Node<T>>>>,
+    tail: Option<Arc<RwLock<Node<T>>>>,
     size: usize,
 }
 
@@ -48,18 +47,18 @@ impl<T: Clone> LinkedListLru<T> {
     }
 
     /// Insert a new node with the given value at the front of the list
-    pub fn push_front(&mut self, value: T) -> Rc<RefCell<Node<T>>> {
-        let new_node = Rc::new(RefCell::new(Node::new(value)));
+    pub fn push_front(&mut self, value: T) -> Arc<RwLock<Node<T>>> {
+        let new_node = Arc::new(RwLock::new(Node::new(value)));
         
         match self.head.take() {
             Some(old_head) => {
-                old_head.borrow_mut().prev = Some(Rc::downgrade(&new_node));
-                new_node.borrow_mut().next = Some(old_head);
-                self.head = Some(Rc::clone(&new_node));
+                old_head.write().unwrap().prev = Some(Arc::downgrade(&new_node));
+                new_node.write().unwrap().next = Some(old_head);
+                self.head = Some(Arc::clone(&new_node));
             }
             None => {
-                self.head = Some(Rc::clone(&new_node));
-                self.tail = Some(Rc::clone(&new_node));
+                self.head = Some(Arc::clone(&new_node));
+                self.tail = Some(Arc::clone(&new_node));
             }
         }
         
@@ -68,18 +67,18 @@ impl<T: Clone> LinkedListLru<T> {
     }
 
     /// Insert a new node with the given value at the back of the list
-    pub fn push_back(&mut self, value: T) -> Rc<RefCell<Node<T>>> {
-        let new_node = Rc::new(RefCell::new(Node::new(value)));
+    pub fn push_back(&mut self, value: T) -> Arc<RwLock<Node<T>>> {
+        let new_node = Arc::new(RwLock::new(Node::new(value)));
         
         match self.tail.take() {
             Some(old_tail) => {
-                old_tail.borrow_mut().next = Some(Rc::clone(&new_node));
-                new_node.borrow_mut().prev = Some(Rc::downgrade(&old_tail));
-                self.tail = Some(Rc::clone(&new_node));
+                old_tail.write().unwrap().next = Some(Arc::clone(&new_node));
+                new_node.write().unwrap().prev = Some(Arc::downgrade(&old_tail));
+                self.tail = Some(Arc::clone(&new_node));
             }
             None => {
-                self.head = Some(Rc::clone(&new_node));
-                self.tail = Some(Rc::clone(&new_node));
+                self.head = Some(Arc::clone(&new_node));
+                self.tail = Some(Arc::clone(&new_node));
             }
         }
         
@@ -92,9 +91,9 @@ impl<T: Clone> LinkedListLru<T> {
         self.head.take().map(|old_head| {
             self.size -= 1;
             
-            match old_head.borrow_mut().next.take() {
+            match old_head.write().unwrap().next.take() {
                 Some(new_head) => {
-                    new_head.borrow_mut().prev = None;
+                    new_head.write().unwrap().prev = None;
                     self.head = Some(new_head);
                 }
                 None => {
@@ -102,11 +101,11 @@ impl<T: Clone> LinkedListLru<T> {
                 }
             }
             
-            let value = old_head.borrow().value.clone();
+            let value = old_head.read().unwrap().value.clone();
             
             // Try to unwrap, but if there are still references, just return the value
-            match Rc::try_unwrap(old_head) {
-                Ok(cell) => cell.into_inner().value,
+            match Arc::try_unwrap(old_head) {
+                Ok(lock) => lock.into_inner().unwrap().value,
                 Err(_) => value,
             }
         })
@@ -117,10 +116,10 @@ impl<T: Clone> LinkedListLru<T> {
         self.tail.take().map(|old_tail| {
             self.size -= 1;
             
-            match old_tail.borrow_mut().prev.take() {
+            match old_tail.write().unwrap().prev.take() {
                 Some(prev_weak) => {
                     if let Some(prev) = prev_weak.upgrade() {
-                        prev.borrow_mut().next = None;
+                        prev.write().unwrap().next = None;
                         self.tail = Some(prev);
                     }
                 }
@@ -129,24 +128,24 @@ impl<T: Clone> LinkedListLru<T> {
                 }
             }
             
-            let value = old_tail.borrow().value.clone();
+            let value = old_tail.read().unwrap().value.clone();
             
             // Try to unwrap, but if there are still references, just return the value
-            match Rc::try_unwrap(old_tail) {
-                Ok(cell) => cell.into_inner().value,
+            match Arc::try_unwrap(old_tail) {
+                Ok(lock) => lock.into_inner().unwrap().value,
                 Err(_) => value,
             }
         })
     }
 
     /// Remove a specific node from the list
-    pub fn remove_node(&mut self, node: &Rc<RefCell<Node<T>>>) {
+    pub fn remove_node(&mut self, node: &Arc<RwLock<Node<T>>>) {
         if self.size == 0 {
             return;
         }
         
-        let is_head = self.head.as_ref().map_or(false, |head| Rc::ptr_eq(head, node));
-        let is_tail = self.tail.as_ref().map_or(false, |tail| Rc::ptr_eq(tail, node));
+        let is_head = self.head.as_ref().map_or(false, |head| Arc::ptr_eq(head, node));
+        let is_tail = self.tail.as_ref().map_or(false, |tail| Arc::ptr_eq(tail, node));
         
         // Handle removing head
         if is_head {
@@ -161,14 +160,14 @@ impl<T: Clone> LinkedListLru<T> {
         }
         
         // Handle removing from middle
-        let mut node_ref = node.borrow_mut();
+        let mut node_ref = node.write().unwrap();
         
         if let Some(prev_weak) = node_ref.prev.take() {
             if let Some(prev) = prev_weak.upgrade() {
                 if let Some(next) = node_ref.next.take() {
                     // Link prev and next nodes
-                    prev.borrow_mut().next = Some(Rc::clone(&next));
-                    next.borrow_mut().prev = Some(Rc::downgrade(&prev));
+                    prev.write().unwrap().next = Some(Arc::clone(&next));
+                    next.write().unwrap().prev = Some(Arc::downgrade(&prev));
                     
                     self.size -= 1;
                 }
@@ -180,7 +179,7 @@ impl<T: Clone> LinkedListLru<T> {
     /// Get an iterator over the values in the list (front to back)
     pub fn iter(&self) -> Iter<T> {
         Iter {
-            current: self.head.as_ref().map(Rc::clone),
+            current: self.head.as_ref().map(Arc::clone),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -188,7 +187,7 @@ impl<T: Clone> LinkedListLru<T> {
 
 /// Iterator for LinkedListLru
 pub struct Iter<T> {
-    current: Option<Rc<RefCell<Node<T>>>>,
+    current: Option<Arc<RwLock<Node<T>>>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -197,8 +196,8 @@ impl<T: Clone> Iterator for Iter<T> {
     
     fn next(&mut self) -> Option<Self::Item> {
         self.current.take().map(|current| {
-            let value = current.borrow().value.clone();
-            self.current = current.borrow().next.as_ref().map(Rc::clone);
+            let value = current.read().unwrap().value.clone();
+            self.current = current.read().unwrap().next.as_ref().map(Arc::clone);
             value
         })
     }
@@ -234,9 +233,9 @@ mod tests {
     #[test]
     fn test_remove_and_move() {
         let mut list = LinkedListLru::new();
-        let _ = list.push_back(1);
+        list.push_back(1);
         let node2 = list.push_back(2);
-        let _ = list.push_back(3);
+        list.push_back(3);
         
         assert_eq!(list.len(), 3);
         
