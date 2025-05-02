@@ -46,12 +46,9 @@ pub struct TableIterator {
     block_metas: Vec<BlockMetadata>,
     current_block_iter: Option<BlockIterator>,
     current_block_idx: Option<usize>,
-    /// Path to the SSTable file (or ID) for page identification
     file_path: PathBuf,
     sst_id: u64,
-    /// Current page ID for the loaded block
     current_page_id: Option<PageId>,
-    /// Metadata for the SSTable
     table_metadata: SstableMetadata,
 }
 

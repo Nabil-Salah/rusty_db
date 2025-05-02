@@ -1,2 +1,2 @@
-mod table_builder;
-mod table_iterator;
+pub mod table_builder;
+pub mod table_iterator;
