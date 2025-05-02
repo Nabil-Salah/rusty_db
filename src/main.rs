@@ -3,6 +3,10 @@ mod shared;
 mod storage;
 mod tests;
 mod wal;
+mod memtable;
+mod lsm_storage;
+mod block;
+mod sstable;
 
 use std::path::Path;
 
@@ -22,7 +26,7 @@ fn main() {
     // Create some new pages and write data to them
     println!("Creating new pages...");
     for _i in 0..5 {
-        if let Some((page_id, page_arc)) = buffer_pool_manager.new_page() {
+        if let Some((page_id, page_arc)) = buffer_pool_manager.new_page(_i) {
             println!("Created page with ID: {}", page_id);
             
             // Write some data to the page

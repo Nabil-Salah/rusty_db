@@ -2,6 +2,7 @@ pub mod lru_replacer;
 pub mod linked_lists;
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::LinkedList;
 
@@ -65,7 +66,6 @@ impl BufferPoolManager {
                 let old_page_id = page.get_page_id();
                 if let Err(e) = self.disk_manager.write_page(old_page_id, &page) {
                     eprintln!("Failed to write dirty page {} to disk: {}", old_page_id, e);
-                    return None;
                 }
                 self.page_table.remove(&old_page_id);
             }
@@ -87,21 +87,21 @@ impl BufferPoolManager {
     }
     
     /// Create a new page in the buffer pool
-    pub fn new_page(&mut self) -> Option<(PageId, Arc<RwLock<Page>>)> {
+    /// Never choose a page id of 0, as it is reserved for the metadata page
+    pub fn new_page(&mut self, page_id: PageId) -> Option<(PageId, Arc<RwLock<Page>>)> {
         let frame_id = match self.get_free_frame() {
             Some(id) => id,
             None => return None,
         };
         
         let page_arc = self.pages[frame_id].clone();
-        let page_id = self.disk_manager.get_next_page_id();
         {
             let mut page = page_arc.write().unwrap();
             if page.get_page_id() != 0 && page.is_dirty() {
                 let old_page_id = page.get_page_id();
                 if let Err(e) = self.disk_manager.write_page(old_page_id, &page) {
                     eprintln!("Failed to write dirty page {} to disk: {}", old_page_id, e);
-                    return None;
+                    // Continue anyway, just losing the old page data
                 }
                 
                 self.page_table.remove(&old_page_id);
@@ -141,7 +141,7 @@ impl BufferPoolManager {
     }
     
     /// Flush a specific page to disk
-    pub fn flush_page(&self, page_id: PageId) -> bool {
+    pub fn flush_page(&mut self, page_id: PageId) -> bool {
         match self.page_table.get(&page_id) {
             Some(&frame_id) => {
                 let page_arc = Arc::clone(&self.pages[frame_id]);
@@ -163,10 +163,10 @@ impl BufferPoolManager {
     }
     
     /// Flush all pages in the buffer pool to disk
-    pub fn flush_all_pages(&self) -> bool {
+    pub fn flush_all_pages(&mut self) -> bool {
         let mut all_success = true;
         
-        for (&page_id, _) in &self.page_table {
+        for (&page_id, _) in &self.page_table.clone() {
             if !self.flush_page(page_id) {
                 all_success = false;
             }
@@ -221,6 +221,10 @@ impl BufferPoolManager {
             None => None,
         }
     }
+
+    pub fn close(&mut self) -> io::Result<()>{
+        self.disk_manager.close()
+    }
 }
 
 #[cfg(test)]
@@ -273,7 +277,7 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Create a new page
-        let (page_id, page_arc) = buffer_pool.new_page().unwrap();
+        let (page_id, page_arc) = buffer_pool.new_page(0).unwrap();
         assert_eq!(page_id, 0); // First page should have id 0
         
         // Check that the page is in the page table
@@ -283,7 +287,7 @@ mod tests {
         assert_eq!(buffer_pool.free_list.len(), pool_size - 1);
         
         // Create another page
-        let (page_id2, _) = buffer_pool.new_page().unwrap();
+        let (page_id2, _) = buffer_pool.new_page(1).unwrap();
         assert_eq!(page_id2, 1); // Second page should have id 1
         
         // Verify the page properties
@@ -304,7 +308,7 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Create a new page
-        let (page_id, page_arc) = buffer_pool.new_page().unwrap();
+        let (page_id, page_arc) = buffer_pool.new_page(0).unwrap();
         
         // Write some data to the page
         {
@@ -342,15 +346,15 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Fill the buffer pool
-        let (page_id1, _) = buffer_pool.new_page().unwrap();
-        let (page_id2, _) = buffer_pool.new_page().unwrap();
+        let (page_id1, _) = buffer_pool.new_page(0).unwrap();
+        let (page_id2, _) = buffer_pool.new_page(1).unwrap();
         
         // Unpin both pages
         assert!(buffer_pool.unpin_page(page_id1, true));
         assert!(buffer_pool.unpin_page(page_id2, false));
         
         // Create a new page, should evict one of the previous pages
-        let (page_id3, _) = buffer_pool.new_page().unwrap();
+        let (page_id3, _) = buffer_pool.new_page(2).unwrap();
         
         // The buffer pool should still have only two pages in the page table
         assert_eq!(buffer_pool.page_table.len(), 2);
@@ -374,7 +378,7 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Create a new page
-        let (page_id, page_arc) = buffer_pool.new_page().unwrap();
+        let (page_id, page_arc) = buffer_pool.new_page(0).unwrap();
         
         // Write some data to the page
         {
@@ -392,11 +396,13 @@ mod tests {
         assert!(buffer_pool.unpin_page(page_id, false));
         
         // Evict the page by filling the buffer pool
-        for _ in 0..pool_size {
-            buffer_pool.new_page().unwrap();
+        for i in 1..=pool_size {
+            buffer_pool.new_page(i as PageId).unwrap();
         }
         
+        // Unpin at least one page to make room in buffer pool
         assert!(buffer_pool.unpin_page(1, false));
+        
         // Fetch the page again, should read from disk
         let fetched_page = buffer_pool.fetch_page(page_id).unwrap();
         
@@ -417,7 +423,7 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Create a new page
-        let (page_id, _) = buffer_pool.new_page().unwrap();
+        let (page_id, _) = buffer_pool.new_page(1).unwrap();
         
         // Unpin the page so it can be deleted
         assert!(buffer_pool.unpin_page(page_id, false));
@@ -442,8 +448,8 @@ mod tests {
         let mut buffer_pool = BufferPoolManager::new(pool_size, disk_manager);
         
         // Create several pages with data
-        let (page_id1, page_arc1) = buffer_pool.new_page().unwrap();
-        let (page_id2, page_arc2) = buffer_pool.new_page().unwrap();
+        let (page_id1, page_arc1) = buffer_pool.new_page(0).unwrap();
+        let (page_id2, page_arc2) = buffer_pool.new_page(1).unwrap();
         
         // Write data to pages
         {
@@ -465,13 +471,15 @@ mod tests {
         buffer_pool.unpin_page(page_id1, false);
         buffer_pool.unpin_page(page_id2, false);
         
-        // Evict pages
-        for _ in 0..pool_size {
-            buffer_pool.new_page().unwrap();
+        // Evict pages by creating new ones
+        for i in 2..=4 {
+            buffer_pool.new_page(i).unwrap();
         }
         
+        // Unpin some pages to make room
         buffer_pool.unpin_page(3, false);
         buffer_pool.unpin_page(2, false);
+        
         // Fetch pages again
         let fetched_page1 = buffer_pool.fetch_page(page_id1).unwrap();
         let fetched_page2 = buffer_pool.fetch_page(page_id2).unwrap();
