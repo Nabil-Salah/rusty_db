@@ -1,10 +1,9 @@
 use crate::buffer::BufferPoolManager;
 use crate::storage::DiskManager;
-use crate::shared::page::{Page, PageId, PAGE_SIZE};
+use crate::shared::page::PAGE_SIZE;
 
 use std::path::Path;
 use std::fs::{self, File};
-use std::io::Write;
 
 fn create_temp_db_file() -> (String, DiskManager) {
     let temp_file = format!("/tmp/rusty_db_integration_test_{}.db", std::process::id());

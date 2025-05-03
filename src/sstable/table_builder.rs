@@ -1,10 +1,8 @@
-use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write, Seek, SeekFrom, BufWriter};
+use std::io::{self, Write, BufWriter};
 use std::path::{Path, PathBuf};
 use byteorder::{LittleEndian, WriteBytesExt};
 use serde_bencode::{ser, Error as BencodeError};
-use bytes::Bytes;
 use serde::{Serialize, Deserialize};
 
 use crate::block::block_builder::{BlockBuilder, DEFAULT_BLOCK_SIZE};
@@ -218,7 +216,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use crate::memtable::MemTable;
-    use std::sync::Arc;
     use std::fs;
 
     // Helper to create a temporary SSTable for testing

@@ -232,7 +232,6 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::fs::{self, File};
-    use std::io::Write;
 
     fn create_temp_db_file() -> (String, DiskManager) {
         let temp_file = format!("/tmp/rusty_db_test_{}.db", std::process::id());

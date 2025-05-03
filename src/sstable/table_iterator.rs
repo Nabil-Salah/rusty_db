@@ -1,4 +1,3 @@
-use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -6,11 +5,10 @@ use std::sync::{Arc, Mutex};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use serde_bencode::{de, Error as BencodeError};
-use serde::{Serialize, Deserialize};
 
 use crate::block::block_iterator::BlockIterator;
 use crate::buffer::BufferPoolManager;
-use crate::shared::page::{Page, PageId};
+use crate::shared::page::PageId;
 use crate::sstable::table_builder::{BlockMetadata, SstableMetadata};
 
 /// Error types for SSTable operations
