@@ -1,6 +1,8 @@
 use crossbeam_skiplist::SkipMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use log::{debug, info, trace, warn};
+use anyhow::{Result, Context, anyhow};
 //use std::ops::Bound;
 
 pub const DEFAULT_SIZE_THRESHOLD: usize = 256 * 1024 * 1024; //256MB
@@ -23,10 +25,10 @@ impl<'a> Iterator for MemTableIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|entry| {
-            (
-                entry.key().clone(),
-                entry.value().as_ref().map(Arc::clone)
-            )
+            let key = entry.key().clone();
+            let value = entry.value().as_ref().map(Arc::clone);
+            trace!("Iterator yielding key of size {}", key.len());
+            (key, value)
         })
     }
 }
@@ -43,8 +45,10 @@ impl<'a> Iterator for MemTableValidIterator<'a> {
         while let Some(entry) = self.inner.next() {
             let key = entry.key().clone();
             if let Some(value) = entry.value().as_ref() {
+                trace!("Valid iterator yielding key of size {}", key.len());
                 return Some((key, Arc::clone(value)));
             }
+            trace!("Skipping tombstone entry");
         }
         None
     }
@@ -72,51 +76,82 @@ impl<'a> Iterator for MemTableValidIterator<'a> {
 impl MemTable {
     /// Creates a new MemTable with the specified size threshold
     pub fn new(size_threshold: Option<usize>) -> Self {
+        let threshold = size_threshold.unwrap_or(DEFAULT_SIZE_THRESHOLD);
+        info!("Creating MemTable with size threshold of {} bytes", threshold);
+        
         MemTable {
             data: SkipMap::new(),
             size: AtomicUsize::new(0),
-            size_threshold: size_threshold.unwrap_or(DEFAULT_SIZE_THRESHOLD),
+            size_threshold: threshold,
         }
     }
 
     /// Inserts a key-value pair into the memtable
-    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Option<Arc<Vec<u8>>> {
+    /// Returns a tuple containing (previous_value, success_flag)
+    /// - previous_value: The previous value if the key existed
+    /// - success_flag: true if the insert was successful, false if it would exceed the size threshold
+    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> (Option<Arc<Vec<u8>>>, bool) {
         let entry_size = key.len() + value.len();
+        debug!("Adding entry with key size {} and value size {}", key.len(), value.len());
         
-        self.size.fetch_add(entry_size, Ordering::Relaxed);        
-        let arc_value = Some(Arc::new(value));
-        
-        match self.data.get(&key) {
+        let (old_value, old_size) = match self.data.get(&key) {
             Some(entry) => {
                 let old_size = key.len() + entry.value().as_ref().map_or(0, |v| v.len());
-                self.size.fetch_sub(old_size, Ordering::Relaxed);
-                let old_value = entry.value().as_ref().map(Arc::clone);
-                self.data.insert(key, arc_value);
-                old_value
-            }
-            None => {
-                self.data.insert(key, arc_value);
-                None
-            }
+                (entry.value().as_ref().map(Arc::clone), old_size)
+            },
+            None => (None, 0)
+        };
+        
+        let current_size = self.size.load(Ordering::Relaxed);
+        let new_size = current_size + entry_size - old_size;
+        
+        if old_size == 0 && new_size > self.size_threshold {
+            warn!("Adding entry would exceed size threshold: current: {}, entry: {}, threshold: {}",
+                  current_size, entry_size, self.size_threshold);
+            return (None, false);
         }
+        
+        if old_size > 0 {
+            if entry_size > old_size {
+                self.size.fetch_add(entry_size - old_size, Ordering::Relaxed);
+            } else {
+                self.size.fetch_sub(old_size - entry_size, Ordering::Relaxed);
+            }
+        } else {
+            self.size.fetch_add(entry_size, Ordering::Relaxed);
+        }
+        
+        let arc_value = Some(Arc::new(value));
+        
+        self.data.insert(key, arc_value);
+        
+        if old_size > 0 {
+            trace!("Updated existing key, old size: {}", old_size);
+        } else {
+            trace!("Inserted new key");
+        }
+        
+        (old_value, true)
     }
 
     /// Marks a key as deleted by inserting a tombstone value (None)
-    /// Returns the previous value if it existed
     pub fn delete(&self, key: Vec<u8>) -> Option<Arc<Vec<u8>>> {
-        let entry_size = key.len() + 1; // 1 byte for the None variant        
-        self.size.fetch_add(entry_size, Ordering::Relaxed);
+        let entry_size = key.len() + 1; // 1 byte for the None variant
+        debug!("Adding tombstone for key of size {}", key.len());
         
+        // Check for existing entry to get the old size
         match self.data.get(&key) {
             Some(entry) => {
                 let old_size = key.len() + entry.value().as_ref().map_or(0, |v| v.len());
-                self.size.fetch_sub(old_size, Ordering::Relaxed);
-                let old_value = entry.value().as_ref().map(Arc::clone);
+                if entry_size > old_size {
+                    self.size.fetch_add(entry_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.size.fetch_sub(old_size - entry_size, Ordering::Relaxed);
+                }
                 self.data.insert(key, None);
-                old_value
-            }
+                entry.value().as_ref().map(Arc::clone)
+            },
             None => {
-                self.data.insert(key, None);
                 None
             }
         }
@@ -125,14 +160,24 @@ impl MemTable {
     /// Gets the value for a key
     /// Returns None if the key doesn't exist or has been deleted
     pub fn get(&self, key: &[u8]) -> Option<Arc<Vec<u8>>> {
+        trace!("Getting value for key of size {}", key.len());
         match self.data.get(key) {
             Some(entry) => {
                 match entry.value() {
-                    Some(arc_value) => Some(Arc::clone(arc_value)),
-                    None => None, // Tombstone, return None
+                    Some(arc_value) => {
+                        trace!("Found value of size {}", arc_value.len());
+                        Some(Arc::clone(arc_value))
+                    },
+                    None => {
+                        trace!("Found tombstone for key");
+                        None // Tombstone, return None
+                    }
                 }
             }
-            None => None,
+            None => {
+                trace!("Key not found");
+                None
+            }
         }
     }
 
@@ -164,6 +209,7 @@ impl MemTable {
     /// Returns an iterator over all key-value pairs in the memtable
     /// Tombstones (deleted entries) are included as (key, None)
     pub fn iter(&self) -> MemTableIterator<'_> {
+        debug!("Creating full iterator over memtable with {} entries", self.data.len());
         MemTableIterator {
             inner: self.data.iter()
         }
@@ -171,6 +217,7 @@ impl MemTable {
 
     /// Returns an iterator over all key-value pairs, filtering out tombstones
     pub fn iter_valid(&self) -> MemTableValidIterator<'_> {
+        debug!("Creating valid-only iterator over memtable");
         MemTableValidIterator {
             inner: self.data.iter()
         }
@@ -183,7 +230,15 @@ impl MemTable {
 
     /// Checks if the memtable has reached its size threshold
     pub fn should_flush(&self) -> bool {
-        self.size() >= self.size_threshold
+        let current_size = self.size();
+        let should_flush = current_size >= self.size_threshold;
+        
+        if should_flush {
+            info!("MemTable reached flush threshold: current size {} >= threshold {}", 
+                  current_size, self.size_threshold);
+        }
+        
+        should_flush
     }
 
     /// Returns the number of entries in the memtable
@@ -198,6 +253,8 @@ impl MemTable {
 
     /// Clears all entries in the memtable
     pub fn clear(&self) {
+        info!("Clearing memtable with {} entries and {} bytes", 
+              self.data.len(), self.size.load(Ordering::Relaxed));
         self.data.clear();
         self.size.store(0, Ordering::Relaxed);
     }
@@ -217,7 +274,7 @@ mod tests {
         let value = b"value1".to_vec();
         let expected_value = Arc::new(value.clone());
         
-        assert_eq!(memtable.put(key.clone(), value.clone()), None);
+        assert_eq!(memtable.put(key.clone(), value.clone()), (None, true));
         assert_eq!(memtable.get(&key).as_ref().map(|v| v.as_ref()), Some(expected_value.as_ref()));
     }
 

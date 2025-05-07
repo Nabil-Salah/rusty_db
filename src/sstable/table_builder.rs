@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use byteorder::{LittleEndian, WriteBytesExt};
 use serde_bencode::{ser, Error as BencodeError};
 use serde::{Serialize, Deserialize};
+use log::{debug, error, info, trace, warn};
+use anyhow::{Result, Context, anyhow};
 
 use crate::block::block_builder::{BlockBuilder, DEFAULT_BLOCK_SIZE};
 use crate::memtable::MemTableValidIterator;
@@ -61,18 +63,21 @@ pub struct TableBuilder {
 
 impl TableBuilder {
     /// Creates a new TableBuilder that writes to the specified file path with default options
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::with_options(path, TableOptions::default())
     }
 
     /// Creates a new TableBuilder with specified options
-    pub fn with_options<P: AsRef<Path>>(path: P, options: TableOptions) -> io::Result<Self> {
+    pub fn with_options<P: AsRef<Path>>(path: P, options: TableOptions) -> Result<Self> {
         let file_path = path.as_ref().to_path_buf();
+        debug!("Creating TableBuilder for file: {}", file_path.display());
+        
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&file_path)?;
+            .open(&file_path)
+            .context(format!("Failed to open SSTable file: {}", file_path.display()))?;
 
         let writer = BufWriter::new(file);
         
@@ -93,7 +98,9 @@ impl TableBuilder {
     /// Adds a key-value pair to the SSTable
     /// The key-value pairs must be added in sorted order
     /// A None value represents a tombstone
-    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
+    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        trace!("Adding key of size {} to SSTable", key.len());
+        
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
@@ -110,22 +117,28 @@ impl TableBuilder {
         let value_bytes = value.unwrap_or(&[]);
         
         // If the block builder is full, finish the current block and start a new one
-        if !self.block_builder.add(key, value_bytes) {
+        let add_result = self.block_builder.add(key, value_bytes)?;
+        if !add_result {
+            debug!("Block full, finishing current block and starting new one");
             self.finish_block()?;
             
             // Start a new block with this key-value pair
             self.current_block_first_key = Some(key.to_vec());
             self.current_block_last_key = Some(key.to_vec());
-            assert!(self.block_builder.add(key, value_bytes), 
-                   "Key-value pair too large for block");
+            
+            let add_result = self.block_builder.add(key, value_bytes)?;
+            if !add_result {
+                return Err(anyhow!("Key-value pair too large for block"));
+            }
         }
         
         Ok(())
     }
 
     /// Finishes the current block and writes it to disk
-    fn finish_block(&mut self) -> io::Result<()> {
+    fn finish_block(&mut self) -> Result<()> {
         if self.block_builder.is_empty() {
+            trace!("Skipping empty block");
             return Ok(());
         }
         
@@ -134,11 +147,17 @@ impl TableBuilder {
         let last_key = self.current_block_last_key.take()
             .expect("Block cannot be non-empty without a last key");
         
-        let block_data = self.block_builder.finish();
+        trace!("Finishing block with key range: {} - {} bytes", 
+               first_key.len(), last_key.len());
+        
+        let block_data = self.block_builder.finish()?;
         let block_size = block_data.len() as u64;
         let block_offset = self.offset;
         
-        self.writer.write_all(&block_data)?;
+        debug!("Writing block of size {} at offset {}", block_size, block_offset);
+        
+        self.writer.write_all(&block_data)
+            .context("Failed to write block data")?;
         self.offset += block_size;
         
         self.block_metas.push(BlockMetadata {
@@ -155,33 +174,49 @@ impl TableBuilder {
     }
 
     /// Builds the Metadata Block containing index information
-    fn build_metadata_block(&self) -> Result<Vec<u8>, BencodeError> {
+    fn build_metadata_block(&self) -> Result<Vec<u8>> {
+        debug!("Building metadata block with {} block entries", self.block_metas.len());
+        
         // Serialize the block metadata using serde_bencode
         ser::to_bytes(&self.block_metas)
+            .context("Failed to serialize block metadata")
     }
 
     /// Finalizes the SSTable by writing all data blocks, metadata block, and footer
-    pub fn finish(mut self) -> io::Result<SstableMetadata> {
+    pub fn finish(mut self) -> Result<SstableMetadata> {
+        info!("Finalizing SSTable: {}", self.file_path.display());
+        
         self.finish_block()?;
         
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone().unwrap_or_default();
         
-        let metadata_block = self.build_metadata_block()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        debug!("Building metadata block");
+        let metadata_block = self.build_metadata_block()?;
         
         let metadata_block_offset = self.offset as u32;
-        self.writer.write_all(&metadata_block)?;
+        debug!("Writing metadata block of size {} at offset {}", 
+               metadata_block.len(), metadata_block_offset);
+               
+        self.writer.write_all(&metadata_block)
+            .context("Failed to write metadata block")?;
         
         self.offset += metadata_block.len() as u64;
         
-        self.writer.write_u32::<LittleEndian>(metadata_block_offset)?;
+        debug!("Writing footer with metadata offset: {}", metadata_block_offset);
+        self.writer.write_u32::<LittleEndian>(metadata_block_offset)
+            .context("Failed to write footer")?;
         
         self.offset += 4; // Footer size (u32)
         
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.flush()
+            .context("Failed to flush SSTable data")?;
+        self.writer.get_ref().sync_all()
+            .context("Failed to sync SSTable file")?;
         
+        info!("SSTable finalized: {} with {} blocks, {} bytes", 
+              self.file_path.display(), self.block_metas.len(), self.offset);
+              
         Ok(SstableMetadata {
             file_path: self.file_path,
             total_size: self.offset,
@@ -197,16 +232,22 @@ impl TableBuilder {
         path: impl AsRef<Path>,
         iter: &mut MemTableValidIterator<'a>,
         options: Option<TableOptions>,
-    ) -> io::Result<SstableMetadata> {
+    ) -> Result<SstableMetadata> {
+        let path_display = path.as_ref().display();
+        info!("Building SSTable from iterator: {}", path_display);
+        
         let mut builder = match options {
             Some(opts) => TableBuilder::with_options(path, opts)?,
             None => TableBuilder::new(path)?,
         };
 
+        let mut count = 0;
         for (key, value) in iter {
             builder.add(&key, Some(value.as_ref()))?;
+            count += 1;
         }
 
+        debug!("Added {} entries to SSTable", count);
         builder.finish()
     }
 }

@@ -71,7 +71,10 @@ impl DiskManager {
         
         let mut buffer = [0u8; PAGE_SIZE];
         
-        let mut file = self.db_file.lock().unwrap();
+        let mut file = match self.db_file.lock() {
+            Ok(file) => file,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to lock file")),
+        };
         file.seek(SeekFrom::Start(offset))?;
         
         match file.read_exact(&mut buffer) {
@@ -91,7 +94,10 @@ impl DiskManager {
             }
         };
         
-        let mut file = self.db_file.lock().unwrap();
+        let mut file = match self.db_file.lock(){
+            Ok(file) => file,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to lock file")),
+        };
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(page.get_data())?;
         file.flush()?;
@@ -181,7 +187,10 @@ impl DiskManager {
         
         // Write the catalog page
         // We don't use self.write_page here to avoid circular logic
-        let mut file = self.db_file.lock().unwrap();
+        let mut file = match self.db_file.lock() {
+            Ok(file) => file,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to lock file")),
+        };
         file.seek(SeekFrom::Start(0))?; // Catalog page is always at offset 0
         file.write_all(catalog_page.get_data())?;
         file.flush()?;
@@ -196,7 +205,10 @@ impl DiskManager {
         let mut catalog_page = Page::new(CATALOG_PAGE_ID);
         
         // Try to read the catalog page from disk
-        let mut file = self.db_file.lock().unwrap();
+        let mut file = match self.db_file.lock() {
+            Ok(file) => file,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to lock file")),
+        };
         file.seek(SeekFrom::Start(0))?;
         
         let mut buffer = [0u8; PAGE_SIZE];

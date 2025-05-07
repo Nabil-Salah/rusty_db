@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use serde_bencode::{de, Error as BencodeError};
+use log::{debug, error, info, trace, warn};
+use anyhow::{Result, Context, anyhow};
 
 use crate::block::block_iterator::BlockIterator;
 use crate::buffer::BufferPoolManager;
@@ -35,7 +37,21 @@ impl From<BencodeError> for TableError {
     }
 }
 
-type Result<T> = std::result::Result<T, TableError>;
+impl std::fmt::Display for TableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableError::IoError(e) => write!(f, "IO error: {}", e),
+            TableError::BencodeError(e) => write!(f, "Bencode error: {}", e),
+            TableError::InvalidFormat(s) => write!(f, "Invalid format: {}", s),
+            TableError::KeyNotFound => write!(f, "Key not found"),
+            TableError::BlockNotFound => write!(f, "Block not found"),
+            TableError::BufferPoolError(s) => write!(f, "Buffer pool error: {}", s),
+            TableError::InvalidState(s) => write!(f, "Invalid state: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for TableError {}
 
 /// TableIterator allows iterating over and searching within an SSTable file
 pub struct TableIterator {
@@ -58,25 +74,45 @@ impl TableIterator {
         buffer_pool: Arc<Mutex<BufferPoolManager>>
     ) -> Result<Self> {
         let file_path = path.as_ref().to_path_buf();
-        let mut file = File::open(&file_path)?;
+        info!("Opening SSTable: {}", file_path.display());
         
-        let file_size = file.metadata()?.len();
+        let mut file = File::open(&file_path)
+            .context(format!("Failed to open SSTable file: {}", file_path.display()))?;
+        
+        let file_size = file.metadata()
+            .context("Failed to get file metadata")?
+            .len();
+            
         if file_size < 4 {
-            return Err(TableError::InvalidFormat("File too small to be a valid SSTable".into()));
+            return Err(anyhow!("File too small to be a valid SSTable"));
         }
         
-        file.seek(SeekFrom::End(-4))?;
+        debug!("Reading footer from SSTable file of size {}", file_size);
+        file.seek(SeekFrom::End(-4))
+            .context("Failed to seek to footer")?;
+            
         let mut footer_buf = [0u8; 4];
-        file.read_exact(&mut footer_buf)?;
+        file.read_exact(&mut footer_buf)
+            .context("Failed to read footer")?;
+            
         let metadata_block_offset = LittleEndian::read_u32(&footer_buf) as u64;
         
         if metadata_block_offset >= file_size - 4 {
-            return Err(TableError::InvalidFormat("Invalid metadata block offset".into()));
+            return Err(anyhow!("Invalid metadata block offset: {} in file of size {}", 
+                           metadata_block_offset, file_size));
         }
         
-        let metadata_block = Self::read_metadata_block(&mut file, metadata_block_offset, file_size - metadata_block_offset - 4)?;
-        file.seek(SeekFrom::End(0))?;
-        let block_metas: Vec<BlockMetadata> = de::from_bytes(&metadata_block)?;
+        debug!("Reading metadata block at offset {}", metadata_block_offset);
+        let metadata_block = Self::read_metadata_block(&mut file, metadata_block_offset, file_size - metadata_block_offset - 4)
+            .context("Failed to read metadata block")?;
+            
+        file.seek(SeekFrom::End(0))
+            .context("Failed to reset file position")?;
+            
+        let block_metas: Vec<BlockMetadata> = de::from_bytes(&metadata_block)
+            .context("Failed to deserialize block metadata")?;
+            
+        debug!("Loaded {} block metadata entries", block_metas.len());
         
         let first_key = block_metas.first().map_or(Vec::new(), |meta| meta.first_key.clone());
         let last_key = block_metas.last().map_or(Vec::new(), |meta| meta.last_key.clone());
@@ -89,6 +125,8 @@ impl TableIterator {
             metadata_block_offset: metadata_block_offset as u32,
             block_count: block_metas.len(),
         };
+        
+        info!("Successfully opened SSTable with {} blocks", block_metas.len());
         
         Ok(TableIterator {
             file,
@@ -105,9 +143,12 @@ impl TableIterator {
     
     /// Reads the metadata block from the file
     fn read_metadata_block(file: &mut File, offset: u64, size: u64) -> Result<Vec<u8>> {
+        trace!("Reading metadata block of size {} from offset {}", size, offset);
         let mut buffer = vec![0u8; size as usize];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut buffer)?;
+        file.seek(SeekFrom::Start(offset))
+            .context("Failed to seek to metadata block")?;
+        file.read_exact(&mut buffer)
+            .context("Failed to read metadata block")?;
         Ok(buffer)
     }
     
@@ -145,12 +186,14 @@ impl TableIterator {
             
             // If the current block iterator is exhausted, move to the next block
             if !iter.is_valid() {
+                trace!("Current block iterator exhausted, moving to next block");
                 if let Some(current_idx) = self.current_block_idx {
                     if current_idx + 1 < self.block_metas.len() {
                         return self.load_block(current_idx + 1);
                     }
                 }
                 // No more blocks, iterator becomes invalid
+                debug!("No more blocks available, iterator becomes invalid");
                 self.current_block_idx = None;
             }
         }
@@ -168,30 +211,36 @@ impl TableIterator {
     /// Seeks to the first key-value pair with a key >= target
     pub fn seek_to_key(&mut self, target: &[u8]) -> Result<bool> {
         if self.block_metas.is_empty() {
+            debug!("Cannot seek in empty SSTable");
             return Ok(false);
         }
 
         if target < &self.block_metas[0].first_key[..] {
+            trace!("Target key is before first key in SSTable, seeking to first entry");
             return self.seek_to_first();
         }
         
         let block_idx = self.find_block_for_key(target);
         if block_idx >= self.block_metas.len() {
+            debug!("Target key is after last key in SSTable");
             self.current_block_iter = None;
             self.current_block_idx = None;
             self.current_page_id = None;
             return Ok(false);
         }
         
+        trace!("Found potential block {} for key", block_idx);
         self.load_block(block_idx)?;
         
         if let Some(ref mut iter) = self.current_block_iter {
             if iter.seek_to_key(target) {
+                trace!("Found key in block {}", block_idx);
                 self.current_block_idx = Some(block_idx);
                 return Ok(true);
             }
         }
         
+        debug!("Key not found in block {}", block_idx);
         Ok(false)
     }
     
@@ -210,6 +259,7 @@ impl TableIterator {
             
             if target <= &meta.last_key[..] {
                 if mid == 0 || target > &self.block_metas[mid - 1].last_key[..] {
+                    trace!("Found block {} for key (key <= block.last_key)", mid);
                     return mid;
                 }
                 right = mid - 1;
@@ -219,96 +269,116 @@ impl TableIterator {
         }
         
         // If the key is greater than all blocks' last keys, return the index past the last block
+        trace!("Key is beyond all blocks, returning index {}", self.block_metas.len());
         self.block_metas.len()
     }
     
     /// Loads a block using the buffer pool
     fn load_block(&mut self, block_idx: usize) -> Result<()> {
         if block_idx >= self.block_metas.len() {
-            return Err(TableError::BlockNotFound);
+            return Err(anyhow!("Block index {} out of bounds (max: {})", 
+                           block_idx, self.block_metas.len() - 1));
         }
         
         let meta = &self.block_metas[block_idx];
+        debug!("Loading block {} with offset {} and size {}", block_idx, meta.offset, meta.size);
         
+        // Unpin the current page if there is one
         if let Some(page_id) = self.current_page_id {
-            let mut pool = self.buffer_pool.lock().map_err(|_| {
-                TableError::BufferPoolError("Failed to lock buffer pool".into())
-            })?;
-            pool.unpin_page(page_id, false);
+            trace!("Unpinning current page {}", page_id);
+            let mut pool = self.buffer_pool.lock()
+                .map_err(|_| anyhow!("Failed to lock buffer pool"))?;
+                
+            if let Err(e) = pool.unpin_page(page_id, false) {
+                warn!("Failed to unpin page {}: {:?}", page_id, e);
+                // Continue even if unpinning fails
+            }
             self.current_page_id = None;
         }
         
         let page_id = self.calculate_page_id(meta.offset);
+        trace!("Calculated page ID {} for block {}", page_id, block_idx);
         
-        let mut pool = self.buffer_pool.lock().map_err(|_| {
-            TableError::BufferPoolError("Failed to lock buffer pool".into())
-        })?;
+        let mut pool = self.buffer_pool.lock()
+            .map_err(|_| anyhow!("Failed to lock buffer pool"))?;
         
-        let page_arc = if let Some(page_arc) = pool.fetch_page(page_id) {
-            // Page is already in the buffer pool
-            page_arc
-        } else {
-            // Page not in buffer pool - we need to allocate a new page and load from disk
-            let mut data = vec![0u8; meta.size as usize];
-            self.file.seek(SeekFrom::Start(meta.offset))?;
-            self.file.read_exact(&mut data)?;
-            
-            // Create a new page in the buffer pool
-            let (_, page_arc) = pool.new_page(page_id).ok_or_else(|| {
-                TableError::BufferPoolError("Failed to create new page in buffer pool".into())
-            })?;
-            
-            // Write data to the page and set its ID
-            {
-                let mut page = page_arc.write().map_err(|_| {
-                    TableError::BufferPoolError("Failed to write to page in buffer pool".into())
-                })?;
+        let page_arc = match pool.fetch_page(page_id) {
+            Ok(page_arc) => {
+                trace!("Page {} found in buffer pool", page_id);
+                page_arc
+            },
+            Err(_) => {
+                debug!("Page {} not in buffer pool, loading from disk", page_id);
+                // Page not in buffer pool - we need to allocate a new page and load from disk
+                let mut data = vec![0u8; meta.size as usize];
+                self.file.seek(SeekFrom::Start(meta.offset))
+                    .context("Failed to seek to block data")?;
+                self.file.read_exact(&mut data)
+                    .context("Failed to read block data")?;
                 
-                let page_data = page.get_data_mut();
-                // Copy data to page (up to page size)
-                let copy_size = std::cmp::min(meta.size as usize, page_data.len());
-                page_data[..copy_size].copy_from_slice(&data[..copy_size]);
+                // Create a new page in the buffer pool
+                let (_, page_arc) = pool.new_page(page_id)
+                    .context("Failed to create new page in buffer pool")?;
                 
-                page.set_page_id(page_id);
+                // Write data to the page and set its ID
+                {
+                    let mut page = page_arc.write()
+                        .map_err(|_| anyhow!("Failed to write to page in buffer pool"))?;
+                    
+                    let page_data = page.get_data_mut();
+                    // Copy data to page (up to page size)
+                    let copy_size = std::cmp::min(meta.size as usize, page_data.len());
+                    page_data[..copy_size].copy_from_slice(&data[..copy_size]);
+                    
+                    page.set_page_id(page_id);
+                    trace!("Data copied to page {}", page_id);
+                }
+                
+                page_arc
             }
-            
-            page_arc
         };
         
         // Read data from the page
         let block_data = {
-            let page = page_arc.read().map_err(|_| {
-                TableError::BufferPoolError("Failed to read page from buffer pool".into())
-            })?;
+            let page = page_arc.read()
+                .map_err(|_| anyhow!("Failed to read page from buffer pool"))?;
             
             Bytes::copy_from_slice(&page.get_data()[..meta.size as usize])
         };
         
         // Create a block iterator over the data
-        self.current_block_iter = Some(BlockIterator::new(block_data));
+        let block_iter = BlockIterator::new(block_data)
+            .context("Failed to create block iterator")?;
+            
+        self.current_block_iter = Some(block_iter);
         self.current_block_idx = Some(block_idx);
         self.current_page_id = Some(page_id);
         
+        debug!("Successfully loaded block {}", block_idx);
         Ok(())
     }
     
     /// Positions the iterator at the first key in the table
     pub fn seek_to_first(&mut self) -> Result<bool> {
         if self.block_metas.is_empty() {
+            debug!("Cannot seek to first in empty SSTable");
             return Ok(false);
         }
         
         // Load the first block
+        debug!("Seeking to first entry in SSTable");
         self.load_block(0)?;
         
         if let Some(ref mut iter) = self.current_block_iter {
             iter.seek_to_first();
             if iter.is_valid() {
+                trace!("Found first valid entry");
                 return Ok(true);
             }
         }
         
         // First block might be empty, try next blocks
+        trace!("First block is empty, trying next blocks");
         self.next()?;
         Ok(self.is_valid())
     }
@@ -324,7 +394,9 @@ impl Drop for TableIterator {
         // Ensure we unpin the current page when the iterator is dropped
         if let Some(page_id) = self.current_page_id {
             if let Ok(mut pool) = self.buffer_pool.lock() {
-                pool.unpin_page(page_id, false);
+                if let Err(e) = pool.unpin_page(page_id, false) {
+                    warn!("Failed to unpin page {} during drop: {:?}", page_id, e);
+                }
             }
         }
     }

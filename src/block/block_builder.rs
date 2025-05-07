@@ -1,5 +1,7 @@
 use std::convert::TryInto;
 use byteorder::{LittleEndian, WriteBytesExt};
+use log::{debug, error, trace};
+use anyhow::{Result, Context};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 4096; // ~4KB
 
@@ -25,6 +27,7 @@ impl BlockBuilder {
 
     /// Creates a new BlockBuilder with a specific target size
     pub fn with_capacity(target_size: usize) -> Self {
+        debug!("Creating BlockBuilder with target size {}", target_size);
         BlockBuilder {
             buffer: Vec::with_capacity(target_size),
             offsets: Vec::new(),
@@ -44,24 +47,31 @@ impl BlockBuilder {
     /// Adds a key-value pair to the block
     /// Returns false if adding would exceed the target size
     /// Assumes keys are added in sorted order
-    pub fn add(&mut self, key: &[u8], value: &[u8]) -> bool { 
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<bool> { 
         let entry_size = 2 + key.len() + 2 + value.len();
         let new_offsets_size = (self.offsets.len() + 1) * 2;
         let count_size = 2;
         let total_size = self.buffer.len() + entry_size + new_offsets_size + count_size;
         
         if total_size > self.target_size {
-            return false;
+            debug!("Adding entry would exceed target size. Current: {}, Entry: {}, Total: {}, Target: {}", 
+                   self.buffer.len(), entry_size, total_size, self.target_size);
+            return Ok(false);
         }
         
-        let offset = self.buffer.len().try_into().unwrap();
+        let offset = self.buffer.len().try_into()
+            .context("Buffer length exceeded u16 max value")?;
+        
         self.offsets.push(offset);
-        self.buffer.write_u16::<LittleEndian>(key.len() as u16).unwrap();
+        self.buffer.write_u16::<LittleEndian>(key.len() as u16)
+            .context("Failed to write key length")?;
         self.buffer.extend_from_slice(key);
-        self.buffer.write_u16::<LittleEndian>(value.len() as u16).unwrap();
+        self.buffer.write_u16::<LittleEndian>(value.len() as u16)
+            .context("Failed to write value length")?;
         self.buffer.extend_from_slice(value);
         
-        true
+        trace!("Added entry with key length {} and value length {}", key.len(), value.len());
+        Ok(true)
     }
 
     /// Returns true if the block is empty
@@ -73,32 +83,43 @@ impl BlockBuilder {
     /// Returns the block as bytes with the following layout:
     /// [Entry #1][Entry #2]...[Entry #N][Padding][Offset #1]...[Offset #N][Num Entries]
     /// The result will always be exactly `target_size` bytes, with padding as needed
-    pub fn finish(&self) -> Vec<u8> {
+    pub fn finish(&self) -> Result<Vec<u8>> {
         if self.is_empty() {
-            return vec![0; self.target_size];
+            debug!("Finishing empty block with size {}", self.target_size);
+            return Ok(vec![0; self.target_size]);
         }
         
         // Calculate size of actual data (entries + offsets + count)
         let data_size = self.buffer.len() + (self.offsets.len() * 2) + 2;
-        let padding_size = self.target_size - data_size;
+        let padding_size = self.target_size.saturating_sub(data_size);
+        
+        if data_size > self.target_size {
+            error!("Block data size {} exceeds target size {}", data_size, self.target_size);
+            return Err(anyhow::anyhow!("Block data size exceeds target size"));
+        }
+        
         let mut result = Vec::with_capacity(self.target_size);
         result.extend_from_slice(&self.buffer);
         result.resize(self.buffer.len() + padding_size, 0);
         
         for &offset in &self.offsets {
-            result.write_u16::<LittleEndian>(offset).unwrap();
+            result.write_u16::<LittleEndian>(offset)
+                .context("Failed to write offset")?;
         }
 
-        result.write_u16::<LittleEndian>(self.offsets.len() as u16).unwrap();
+        result.write_u16::<LittleEndian>(self.offsets.len() as u16)
+            .context("Failed to write entry count")?;
         
         debug_assert_eq!(result.len(), self.target_size, 
                         "Block size should be exactly target_size");
         
-        result
+        debug!("Finished block with {} entries and {} bytes", self.offsets.len(), result.len());
+        Ok(result)
     }
 
     /// Resets the block builder to empty state
     pub fn reset(&mut self) {
+        debug!("Resetting block builder");
         self.buffer.clear();
         self.offsets.clear();
     }
@@ -115,7 +136,7 @@ mod tests {
         assert!(builder.is_empty());
         assert_eq!(builder.estimated_size(), 0);
         
-        let block = builder.finish();
+        let block = builder.finish().unwrap();
         // An empty block should still be target_size bytes but filled with zeros
         assert_eq!(block.len(), 100);
         assert!(block.iter().all(|&b| b == 0));
@@ -129,10 +150,10 @@ mod tests {
         let key = b"key1";
         let value = b"value1";
         
-        assert!(builder.add(key, value));
+        assert!(builder.add(key, value).unwrap());
         assert!(!builder.is_empty());
         
-        let block = builder.finish();
+        let block = builder.finish().unwrap();
         
         // Block should be exactly target_size bytes
         assert_eq!(block.len(), 100);
@@ -170,11 +191,11 @@ mod tests {
         let mut builder = BlockBuilder::with_capacity(200);
         
         // Add entries in sorted order
-        assert!(builder.add(b"key1", b"value1"));
-        assert!(builder.add(b"key2", b"value2"));
-        assert!(builder.add(b"key3", b"value3"));
+        assert!(builder.add(b"key1", b"value1").unwrap());
+        assert!(builder.add(b"key2", b"value2").unwrap());
+        assert!(builder.add(b"key3", b"value3").unwrap());
         
-        let block = builder.finish();
+        let block = builder.finish().unwrap();
         
         // Block should be exactly target_size bytes
         assert_eq!(block.len(), 200);
@@ -209,7 +230,7 @@ mod tests {
     fn test_reset() {
         let mut builder = BlockBuilder::with_capacity(100);
         
-        assert!(builder.add(b"key1", b"value1"));
+        assert!(builder.add(b"key1", b"value1").unwrap());
         assert!(!builder.is_empty());
         
         builder.reset();
@@ -217,8 +238,8 @@ mod tests {
         assert_eq!(builder.estimated_size(), 0);
         
         // After reset, should be able to add again
-        assert!(builder.add(b"key2", b"value2"));
-        let block = builder.finish();
+        assert!(builder.add(b"key2", b"value2").unwrap());
+        let block = builder.finish().unwrap();
         assert_eq!(block.len(), 100); // Should always be target_size
     }
     
@@ -241,13 +262,13 @@ mod tests {
         let mut builder = BlockBuilder::with_capacity(target_size);
         
         // First entry should succeed
-        assert!(builder.add(key1, value1), "First entry should fit exactly");
+        assert!(builder.add(key1, value1).unwrap(), "First entry should fit exactly");
         
         // Second entry should fail - even the smallest additional entry won't fit
-        assert!(!builder.add(key2, value2), "Second entry should not fit");
+        assert!(!builder.add(key2, value2).unwrap(), "Second entry should not fit");
         
         // Verify block size
-        let block = builder.finish();
+        let block = builder.finish().unwrap();
         assert_eq!(block.len(), target_size, "Block should be exactly target_size bytes");
     }
     
@@ -257,13 +278,13 @@ mod tests {
         let mut builder = BlockBuilder::with_capacity(100);
         
         // Add a small entry
-        builder.add(b"key", b"value");
+        builder.add(b"key", b"value").unwrap();
         
         // The actual data size would be:
         // key_len(2) + key(3) + value_len(2) + value(5) + offset(2) + count(2) = 16 bytes
         // So we should have 100 - 16 = 84 bytes of padding
         
-        let block = builder.finish();
+        let block = builder.finish().unwrap();
         assert_eq!(block.len(), 100); // Full target size
         
         // Verify the count is at the end

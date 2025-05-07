@@ -52,17 +52,17 @@ fn test_buffer_pool_with_disk_manager() {
     }
     
     // Unpin pages so they can be evicted
-    assert!(buffer_pool.unpin_page(page_id1, true));
-    assert!(buffer_pool.unpin_page(page_id2, true));
+    buffer_pool.unpin_page(page_id1, true).expect("Failed to unpin page 1");
+    buffer_pool.unpin_page(page_id2, true).expect("Failed to unpin page 2");
     
     // Flush pages to disk
-    assert!(buffer_pool.flush_all_pages());
+    buffer_pool.flush_all_pages().expect("Failed to flush all pages");
     
     // Create more pages to evict the previous ones
     for i in 2..pool_size+2 {
         let (page_id, _) = buffer_pool.new_page((i+1) as u64).unwrap();
         // Immediately unpin to ensure our previous pages can be evicted
-        buffer_pool.unpin_page(page_id, false);
+        buffer_pool.unpin_page(page_id, false).expect("Failed to unpin page");
     }
     
     // Now fetch the original pages (should be read from disk)
@@ -108,7 +108,7 @@ fn test_buffer_pool_eviction_mechanism() {
         }
         
         // Unpin the page so it can be evicted
-        buffer_pool.unpin_page(page_id, true);
+        buffer_pool.unpin_page(page_id, true).expect("Failed to unpin page");
     }
     
     // Create more pages to trigger eviction
@@ -123,7 +123,7 @@ fn test_buffer_pool_eviction_mechanism() {
         }
         
         // Unpin the page
-        buffer_pool.unpin_page(page_id, true);
+        buffer_pool.unpin_page(page_id, true).expect("Failed to unpin page");
     }
     
     // Now try to fetch the original pages (should be read from disk)
@@ -191,10 +191,7 @@ fn test_concurrent_page_access() {
                     }
                     
                     // Unpin the page
-                    {
-                        let mut pool = pool_clone.lock().unwrap();
-                        pool.unpin_page(page_id, true);
-                    }
+                    let _ = pool_clone.lock().unwrap().unpin_page(page_id, true).expect("Failed to unpin page");
                 }
             })
         })
@@ -241,11 +238,11 @@ fn test_large_data_operation() {
         }
         
         // Unpin the page so it can be evicted
-        buffer_pool.unpin_page(page_id, true);
+        buffer_pool.unpin_page(page_id, true).expect("Failed to unpin page");
     }
     
     // Flush all pages to disk
-    assert!(buffer_pool.flush_all_pages());
+    buffer_pool.flush_all_pages().expect("Failed to flush all pages");
     
     // Now read pages in reverse order to test disk reads
     for (i, &page_id) in page_ids.iter().enumerate().rev() {
@@ -260,7 +257,7 @@ fn test_large_data_operation() {
         }
         
         // Unpin the page
-        buffer_pool.unpin_page(page_id, false);
+        buffer_pool.unpin_page(page_id, false).expect("Failed to unpin page");
     }
     
     cleanup_temp_file(&temp_file);
@@ -290,10 +287,10 @@ fn test_buffer_pool_recovery() {
         }
         
         // Unpin and flush
-        buffer_pool.unpin_page(page_id1, true);
-        buffer_pool.unpin_page(page_id2, true);
-        buffer_pool.flush_all_pages();
-        _ = buffer_pool.close();
+        buffer_pool.unpin_page(page_id1, true).expect("Failed to unpin page 1");
+        buffer_pool.unpin_page(page_id2, true).expect("Failed to unpin page 2");
+        buffer_pool.flush_all_pages().expect("Failed to flush all pages");
+        let _ = buffer_pool.close().expect("Failed to close buffer pool");
     }
     // First buffer pool is dropped here
     
@@ -303,14 +300,30 @@ fn test_buffer_pool_recovery() {
         let mut buffer_pool = BufferPoolManager::new(5, disk_manager);
         
         // Read page 1
-        let page1 = buffer_pool.fetch_page(1).unwrap();
+        let page1 = match buffer_pool.fetch_page(1) {
+            Ok(page) => page,
+            Err(e) => {
+                assert!(false, "Error fetching page 1: {:?}", e);
+                cleanup_temp_file(&temp_file);
+                return;
+            }
+        };
+        
         {
             let p = page1.read().unwrap();
             assert_eq!(&p.get_data()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
         }
         
         // Read page 2
-        let page2 = buffer_pool.fetch_page(2).unwrap();
+        let page2 = match buffer_pool.fetch_page(2) {
+            Ok(page) => page,
+            Err(e) => {
+                assert!(false, "Error fetching page 2: {:?}", e);
+                cleanup_temp_file(&temp_file);
+                return;
+            }
+        };
+        
         {
             let p = page2.read().unwrap();
             assert_eq!(&p.get_data()[0..4], &[0xCA, 0xFE, 0xBA, 0xBE]);

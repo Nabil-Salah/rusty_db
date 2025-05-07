@@ -6,6 +6,8 @@ pub use record::{LogOperation, LogRecord};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use log::{debug, error, info, trace, warn};
+use anyhow::{Result, Context};
 
 
 /// Write-Ahead Log for durability and crash recovery
@@ -17,12 +19,15 @@ pub struct WriteAheadLog {
 
 impl WriteAheadLog {
     /// Create a new WriteAheadLog at the specified path with default configuration
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_str = path.as_ref().to_string_lossy().to_string();
+        info!("Creating WriteAheadLog at {}", path_str);
+        
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .open(&path)
+            .context(format!("Failed to open WAL file at {}", path_str))?;
 
         let writer = BufWriter::new(file);
 
@@ -34,15 +39,22 @@ impl WriteAheadLog {
     }
 
     /// Append a log record to the WAL with potential auto-flush
-    pub fn append(&mut self, record: LogRecord) -> io::Result<()> {
-        let serialized = record.serialize()?;
-        let record_size = serialized.len();
+    pub fn append(&mut self, record: LogRecord) -> Result<()> {
+        trace!("Appending record with timestamp {}", record.timestamp);
         
-        self.writer.write_all(&serialized)?;
+        let serialized = record.serialize()
+            .context("Failed to serialize log record")?;
+        let record_size = serialized.len();
+        debug!("Serialized record size: {}", record_size);
+        
+        self.writer.write_all(&serialized)
+            .context("Failed to write record to WAL")?;
 
         
         if Utc::now().timestamp() - self.last_time > 10 {
-            self.writer.flush()?;
+            debug!("Auto-flushing WAL (time-based)");
+            self.writer.flush()
+                .context("Failed to auto-flush WAL")?;
             self.last_time = Utc::now().timestamp();
         }
         
@@ -50,27 +62,36 @@ impl WriteAheadLog {
     }
 
     /// Create a log record for a PUT operation and append it
-    pub fn put<K, V>(&mut self, key: K, value: V) -> io::Result<()>
+    pub fn put<K, V>(&mut self, key: K, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let record = LogRecord::new_put(key.as_ref().to_vec(), value.as_ref().to_vec());
+        let key_bytes = key.as_ref();
+        let value_bytes = value.as_ref();
+        debug!("Creating PUT record for key of size {}", key_bytes.len());
+        
+        let record = LogRecord::new_put(key_bytes.to_vec(), value_bytes.to_vec());
         self.append(record)
     }
 
     /// Create a log record for a DELETE operation and append it
-    pub fn delete<K>(&mut self, key: K) -> io::Result<()>
+    pub fn delete<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        let record = LogRecord::new_delete(key.as_ref().to_vec());
+        let key_bytes = key.as_ref();
+        debug!("Creating DELETE record for key of size {}", key_bytes.len());
+        
+        let record = LogRecord::new_delete(key_bytes.to_vec());
         self.append(record)
     }
 
     /// Flush any buffered data to disk
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
+    pub fn flush(&mut self) -> Result<()> {
+        debug!("Manually flushing WAL");
+        self.writer.flush()
+            .context("Failed to flush WAL")?;
         self.last_time = Utc::now().timestamp();
         Ok(())
     }
