@@ -11,6 +11,7 @@ mod logger;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
 
 use buffer::BufferPoolManager;
 use storage::DiskManager;
@@ -25,11 +26,8 @@ fn main() {
     // Initialize the logger
     logger::init(debug_mode).expect("Failed to initialize logger");
     
-    logger::info!("Rusty DB Demo");
+    logger::info!("Rusty DB Starting");
 
-    // First: LSM Storage Demo
-    logger::info!("=== Rusty DB LSM Storage Demo ===");
-    
     // Set up the LSM storage
     let data_dir = PathBuf::from("./data");
     
@@ -85,56 +83,98 @@ fn main() {
     }
     logger::debug!("Background flusher started successfully");
     
-    // Perform some naive put operations
-    logger::info!("Putting key-value pairs into LSM storage...");
-    let test_pairs = [
-        ("user:1001", "John Doe"),
-        ("user:1002", "Jane Smith"),
-        ("user:1003", "Bob Johnson"),
-        ("config:theme", "dark"),
-        ("config:language", "en-US")
-    ];
-    
-    for (key, value) in test_pairs {
-        match lsm_storage.put(key.as_bytes().to_vec(), value.as_bytes().to_vec()) {
-            Ok(_) => logger::info!("  Put: {} = {}", key, value),
-            Err(e) => logger::error!("  Failed to put {}: {}", key, e)
-        }
-    }
-    
-    // Perform some naive get operations
-    logger::info!("\nGetting values from LSM storage...");
-    for key in ["user:1001", "user:1002", "user:1003", "config:theme", "config:language", "non-existent-key"] {
-        match lsm_storage.get(key.as_bytes()) {
-            Ok(Some(value)) => {
-                let value_str = String::from_utf8_lossy(&value);
-                logger::info!("  Get: {} = {}", key, value_str);
-            },
-            Ok(None) => logger::info!("  Key not found: {}", key),
-            Err(e) => logger::error!("  Error retrieving key {}: {}", key, e)
-        }
-    }
-    
-    // Delete a key
-    logger::info!("\nDeleting a key from LSM storage...");
-    match lsm_storage.delete("user:1002".as_bytes().to_vec()) {
-        Ok(_) => logger::info!("  Deleted: user:1002"),
-        Err(e) => logger::error!("  Failed to delete user:1002: {}", e)
-    }
-    
-    // Try to get the deleted key
-    match lsm_storage.get("user:1002".as_bytes()) {
-        Ok(Some(value)) => logger::warn!("  Unexpectedly found deleted key: user:1002 = {}", String::from_utf8_lossy(&value)),
-        Ok(None) => logger::info!("  Verified key was deleted: user:1002 is not found"),
-        Err(e) => logger::error!("  Error checking deleted key: {}", e)
-    }
+    // Run the interactive CLI
+    run_interactive_cli(&mut lsm_storage);
     
     // Shutdown the LSM storage engine properly
-    logger::info!("\nShutting down LSM storage...");
+    logger::info!("Shutting down LSM storage...");
     if let Err(e) = lsm_storage.shutdown() {
         logger::error!("Error during LSM storage shutdown: {}", e);
     } else {
         logger::info!("LSM storage shut down successfully");
+    }
+}
+
+fn run_interactive_cli(lsm_storage: &mut LSMStorage) {
+    println!("Welcome to Rusty DB interactive CLI!");
+    println!("Available commands:");
+    println!("  get <key>         - Retrieve a value by key");
+    println!("  put <key> <value> - Store a key-value pair");
+    println!("  delete <key>      - Delete a key");
+    println!("  exit              - Exit the program");
+    println!();
+    
+    let mut input = String::new();
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        
+        input.clear();
+        if io::stdin().read_line(&mut input).is_err() {
+            println!("Error reading input. Please try again.");
+            continue;
+        }
+        
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        
+        match parts[0].to_lowercase().as_str() {
+            "get" => {
+                if parts.len() != 2 {
+                    println!("Usage: get <key>");
+                    continue;
+                }
+                
+                let key = parts[1].as_bytes();
+                match lsm_storage.get(key) {
+                    Ok(Some(value)) => {
+                        match String::from_utf8(value.as_ref().to_vec()) {
+                            Ok(value_str) => println!("Value: {}", value_str),
+                            Err(_) => println!("Value (binary): {:?}", value),
+                        }
+                    },
+                    Ok(None) => println!("Key not found: {}", parts[1]),
+                    Err(e) => println!("Error retrieving key: {}", e),
+                }
+            },
+            "put" => {
+                if parts.len() < 3 {
+                    println!("Usage: put <key> <value>");
+                    continue;
+                }
+                
+                let key = parts[1].as_bytes().to_vec();
+                // Join the remaining parts to support values with spaces
+                let value = parts[2..].join(" ").as_bytes().to_vec();
+                
+                match lsm_storage.put(key, value) {
+                    Ok(_) => println!("Successfully stored the key-value pair"),
+                    Err(e) => println!("Error storing key-value pair: {}", e),
+                }
+            },
+            "delete" => {
+                if parts.len() != 2 {
+                    println!("Usage: delete <key>");
+                    continue;
+                }
+                
+                let key = parts[1].as_bytes().to_vec();
+                match lsm_storage.delete(key) {
+                    Ok(_) => println!("Successfully deleted the key"),
+                    Err(e) => println!("Error deleting key: {}", e),
+                }
+            },
+            "exit" => {
+                println!("Exiting Rusty DB...");
+                break;
+            },
+            _ => {
+                println!("Unknown command: {}", parts[0]);
+                println!("Available commands: get, put, delete, exit");
+            }
+        }
     }
 }
 
